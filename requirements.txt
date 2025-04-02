@@ -1,0 +1,9 @@
+h5py
+hdf5plugin
+numpy
+numba
+torch
+torchvision
+matplotlib
+opencv-python
+einops
