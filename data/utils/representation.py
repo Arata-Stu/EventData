@@ -6,6 +6,52 @@ import cv2
 
 
 from abc import ABC, abstractmethod
+import numba as nb
+
+@nb.njit
+def create_frame_jit(x, y, pol, height, width):
+    """
+    Numba による JIT 化版 majority vote 関数。
+    ループを用いて ON/OFF のカウントを行い、最終的なピクセル値を決定する。
+    """
+    # 各ピクセル位置の ON/OFF カウント (1次元配列)
+    counts_on = np.zeros(height * width, dtype=np.int32)
+    counts_off = np.zeros(height * width, dtype=np.int32)
+    n = x.shape[0]
+    
+    for i in range(n):
+        # 座標のクリッピング
+        xi = x[i]
+        if xi < 0:
+            xi = 0
+        elif xi >= width:
+            xi = width - 1
+        
+        yi = y[i]
+        if yi < 0:
+            yi = 0
+        elif yi >= height:
+            yi = height - 1
+        
+        idx = yi * width + xi
+        
+        # イベントのカウント（pol==1: ON, pol==0: OFF）
+        if pol[i] == 1:
+            counts_on[idx] += 1
+        elif pol[i] == 0:
+            counts_off[idx] += 1
+    
+    # 出力フレームを 1 次元配列で生成
+    frame = np.empty(height * width, dtype=np.uint8)
+    for i in range(height * width):
+        diff = counts_on[i] - counts_off[i]
+        if diff > 0:
+            frame[i] = 255
+        elif diff < 0:
+            frame[i] = 0
+        else:
+            frame[i] = 127
+    return frame.reshape(height, width)
 
 class RepresentationBase(ABC):
     @abstractmethod
@@ -49,39 +95,32 @@ class EventFrame(RepresentationBase):
         :return: RGB画像 (torch.Tensor)
         """
         device = x.device
-        # 2チャンネルのカウント用テンソルを初期化 (0: ON, 1: OFF)
-        counts = th.zeros((2, self.height, self.width), dtype=th.int32, device=device)
-        
         # 座標をフレームサイズ内にクリップ
         x_clipped = th.clamp(x, min=0, max=self.width - 1)
         y_clipped = th.clamp(y, min=0, max=self.height - 1)
         
-        # ON イベントのカウント
+        # ON/OFF のマスク作成
         on_mask = (pol == 1)
-        if on_mask.sum() > 0:
-            counts.index_put_((0, y_clipped[on_mask], x_clipped[on_mask]),
-                              th.ones_like(x_clipped[on_mask], dtype=counts.dtype, device=device),
-                              accumulate=True)
-        
-        # OFF イベントのカウント
         off_mask = (pol == 0)
-        if off_mask.sum() > 0:
-            counts.index_put_((1, y_clipped[off_mask], x_clipped[off_mask]),
-                              th.ones_like(x_clipped[off_mask], dtype=counts.dtype, device=device),
-                              accumulate=True)
         
-        # 多数決: 差分 = ON - OFF
-        diff = counts[0] - counts[1]
+        # 1次元のインデックスに変換：idx = y * width + x
+        idx_on = y_clipped[on_mask] * self.width + x_clipped[on_mask]
+        idx_off = y_clipped[off_mask] * self.width + x_clipped[off_mask]
         
-        # 出力画像を灰色（127）で初期化
-        img = th.full((3, self.height, self.width), fill_value=127, dtype=th.uint8, device=device)
+        # torch.bincount により、各ピクセルのカウントを集計（出力は1次元なので reshape する）
+        count_on = th.bincount(idx_on, minlength=self.height * self.width).reshape(self.height, self.width)
+        count_off = th.bincount(idx_off, minlength=self.height * self.width).reshape(self.height, self.width)
         
-        # ON が多数の場合は白（255）、OFF が多数の場合は黒（0）に設定
-        white_mask = (diff > 0)
-        black_mask = (diff < 0)
-        for c in range(3):
-            img[c][white_mask] = 255
-            img[c][black_mask] = 0
+        # 差分計算：多数決（diff > 0: ON 多, diff < 0: OFF 多, diff == 0: 同数）
+        diff = count_on - count_off
+        
+        # 単一チャンネルのフレーム作成：初期値 127（灰色）
+        frame = th.full((self.height, self.width), 127, dtype=th.uint8, device=device)
+        frame[diff > 0] = 255  # ON 多 -> 白
+        frame[diff < 0] = 0    # OFF 多 -> 黒
+        
+        # 3 チャンネル画像に変換
+        img = th.stack([frame, frame, frame], dim=0)
         
         # ダウンサンプリングが必要な場合はリサイズ
         if self.downsample:
@@ -93,46 +132,24 @@ class EventFrame(RepresentationBase):
             ).squeeze(0).to(th.uint8)
         
         return img
+
+
     
     def create_frame_numpy(self, x: np.ndarray, y: np.ndarray, pol: np.ndarray, time: np.ndarray) -> np.ndarray:
         """
-        Majority vote によるイベントフレームを作成する (NumPy版)。
-        各ピクセルで ON と OFF のイベント数をカウントし、多数決を行う。
+        Majority vote によるイベントフレームを作成する (NumPy版＋Numba JIT)。
+        JIT 化した関数を用いて各ピクセルで ON と OFF のイベント数をカウントし、多数決を行う。
+        
         :param x: x 座標
         :param y: y 座標
         :param pol: イベントの極性 (+1 for ON, 0 for OFF)
         :param time: タイムスタンプ（未使用）
         :return: RGB画像 (numpy.ndarray)
         """
-        # 2チャンネルのカウント用配列を初期化 (0: ON, 1: OFF)
-        counts = np.zeros((2, self.height, self.width), dtype=np.int32)
-        
-        # 座標をフレームサイズ内にクリップ
-        x_clipped = np.clip(x, 0, self.width - 1)
-        y_clipped = np.clip(y, 0, self.height - 1)
-        
-        # ON イベントのカウント
-        on_mask = (pol == 1)
-        if np.any(on_mask):
-            np.add.at(counts[0], (y_clipped[on_mask], x_clipped[on_mask]), 1)
-        
-        # OFF イベントのカウント
-        off_mask = (pol == 0)
-        if np.any(off_mask):
-            np.add.at(counts[1], (y_clipped[off_mask], x_clipped[off_mask]), 1)
-        
-        # 多数決: 差分 = ON - OFF
-        diff = counts[0] - counts[1]
-        
-        # 出力画像を灰色（127）で初期化
-        img = np.full((3, self.height, self.width), 127, dtype=np.uint8)
-        
-        # ON が多数の場合は白（255）、OFF が多数の場合は黒（0）に設定
-        white_mask = diff > 0
-        black_mask = diff < 0
-        for c in range(3):
-            img[c][white_mask] = 255
-            img[c][black_mask] = 0
+        # JIT 化した関数で majority vote 結果（2D フレーム）を取得
+        frame = create_frame_jit(x, y, pol, self.height, self.width)
+        # 3チャンネル画像に変換
+        img = np.stack([frame] * 3, axis=0)
         
         # ダウンサンプリングが必要な場合はリサイズ
         if self.downsample:
