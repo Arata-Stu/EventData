@@ -53,6 +53,50 @@ def create_frame_jit(x, y, pol, height, width):
             frame[i] = 127
     return frame.reshape(height, width)
 
+
+@nb.njit
+def compute_histogram_jit(x, y, time, pol, bins, height, width, count_cutoff):
+    n = x.shape[0]
+    # チャンネルは 2 として、int32 で集計
+    rep = np.zeros((2, bins, height, width), dtype=np.int32)
+    t0 = time[0]
+    t1 = time[-1]
+    dt = t1 - t0
+    if dt < 1:
+        dt = 1  # ゼロ除算回避
+    for i in range(n):
+        # 時間の正規化と bin インデックスの計算
+        t_norm = (time[i] - t0) / dt
+        t_idx = int(t_norm * bins)
+        if t_idx >= bins:
+            t_idx = bins - 1
+
+        # 座標のクリッピング
+        xi = x[i]
+        if xi < 0:
+            xi = 0
+        elif xi >= width:
+            xi = width - 1
+
+        yi = y[i]
+        if yi < 0:
+            yi = 0
+        elif yi >= height:
+            yi = height - 1
+
+        # チャンネル（pol: 0または1）を決定してカウントを加算
+        c = int(pol[i])
+        rep[c, t_idx, yi, xi] += 1
+
+    # 各画素で count_cutoff を超えた部分をクリップ
+    for c in range(2):
+        for b in range(bins):
+            for i in range(height):
+                for j in range(width):
+                    if rep[c, b, i, j] > count_cutoff:
+                        rep[c, b, i, j] = count_cutoff
+    return rep
+
 class RepresentationBase(ABC):
     @abstractmethod
     def construct(self, x: th.Tensor, y: th.Tensor, pol: th.Tensor, time: th.Tensor) -> th.Tensor:
@@ -187,25 +231,13 @@ class EventFrame(RepresentationBase):
 
 class StackedHistogram(RepresentationBase):
     def __init__(self, bins: int, height: int, width: int, count_cutoff: Optional[int] = None, fastmode: bool = True, downsample: bool = False):
-        """
-        In case of fastmode == True: use uint8 to construct the representation, but could lead to overflow.
-        In case of fastmode == False: use int16 to construct the representation, and convert to uint8 after clipping.
-
-        Note: Overflow should not be a big problem because it happens only for hot pixels. In case of overflow,
-        the value will just start accumulating from 0 again.
-        """
         assert bins >= 1
         self.bins = bins
         assert height >= 1
         self.height = height
         assert width >= 1
         self.width = width
-        self.count_cutoff = count_cutoff
-        if self.count_cutoff is None:
-            self.count_cutoff = 255
-        else:
-            assert count_cutoff >= 1
-            self.count_cutoff = min(count_cutoff, 255)
+        self.count_cutoff = 255 if count_cutoff is None else min(count_cutoff, 255)
         self.fastmode = fastmode
         self.channels = 2
         self.downsample = downsample
@@ -218,19 +250,50 @@ class StackedHistogram(RepresentationBase):
     def get_torch_dtype() -> th.dtype:
         return th.uint8
 
-    def merge_channel_and_bins(self, representation: th.Tensor):
-        assert representation.dim() == 4
-        return th.reshape(representation, (-1, self.height, self.width))
+    def merge_channel_and_bins(self, representation: np.ndarray):
+        # representation の shape: (channels, bins, height, width)
+        return representation.reshape((-1, self.height, self.width))
 
     def get_shape(self) -> Tuple[int, int, int]:
         if self.downsample:
-            return 2 * self.bins, self.height // 2, self.width // 2
-        return 2 * self.bins, self.height, self.width
+            return (2 * self.bins, self.height // 2, self.width // 2)
+        return (2 * self.bins, self.height, self.width)
 
+    def create_from_numpy(self, x: np.ndarray, y: np.ndarray, pol: np.ndarray, time: np.ndarray) -> np.ndarray:
+        assert x.shape == y.shape == pol.shape == time.shape
+        dtype = np.uint8 if self.fastmode else np.int16
+
+        # イベントが無い場合は空のヒストグラムを返す
+        if x.size == 0:
+            representation = np.zeros((self.channels, self.bins, self.height, self.width), dtype=dtype)
+            return self.merge_channel_and_bins(representation.astype(np.uint8))
+
+        # JIT 化した関数を用いてヒストグラムを計算
+        rep = compute_histogram_jit(x, y, time, pol, self.bins, self.height, self.width, self.count_cutoff)
+        # fastmode の場合は uint8 に変換
+        if self.fastmode:
+            rep = rep.astype(np.uint8)
+        else:
+            rep = rep.astype(np.int16)
+
+        # ダウンサンプリングが必要な場合は cv2.resize を利用
+        if self.downsample:
+            new_height = self.height // 2
+            new_width = self.width // 2
+            rep_resized = np.zeros((self.channels, self.bins, new_height, new_width), dtype=np.uint8)
+            for c in range(self.channels):
+                for b in range(self.bins):
+                    rep_resized[c, b] = cv2.resize(rep[c, b], (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+            rep = rep_resized
+            out_shape = (2 * self.bins, new_height, new_width)
+        else:
+            out_shape = (2 * self.bins, self.height, self.width)
+
+        return rep.reshape(out_shape)
 
     def create_frame_tensor(self, x: th.Tensor, y: th.Tensor, pol: th.Tensor, time: th.Tensor) -> th.Tensor:
+        # こちらは PyTorch 版の処理です。JIT 化の対象は主に numpy 版で検証するという前提です。
         device = x.device
-
         assert y.device == pol.device == time.device == device
         dtype = th.uint8 if self.fastmode else th.int16
 
@@ -260,37 +323,6 @@ class StackedHistogram(RepresentationBase):
             ).squeeze(0).to(th.uint8)
 
         return self.merge_channel_and_bins(representation)
-    
-    def create_from_numpy(self, x: np.ndarray, y: np.ndarray, pol: np.ndarray, time: np.ndarray) -> np.ndarray:
-        assert x.shape == y.shape == pol.shape == time.shape
-        dtype = np.uint8 if self.fastmode else np.int16
-
-        representation = np.zeros((self.channels, self.bins, self.height, self.width), dtype=dtype)
-        if x.size == 0:
-            representation = representation.reshape((2 * self.bins, self.height, self.width))
-            return representation.astype(np.uint8)
-
-        t0_int = time[0]
-        t1_int = time[-1]
-        t_norm = (time - t0_int) / max((t1_int - t0_int), 1)
-        t_idx = np.clip((t_norm * self.bins).astype(np.int32), 0, self.bins - 1)
-
-        indices = x + self.width * y + self.height * self.width * t_idx + self.bins * self.height * self.width * pol
-        values = np.ones_like(indices, dtype=dtype)
-        np.add.at(representation.flatten(), indices, values)
-        representation = np.clip(representation, 0, self.count_cutoff)
-
-        if self.downsample:
-            new_height = self.height // 2
-            new_width = self.width // 2
-            representation_resized = np.zeros((self.channels, self.bins, new_height, new_width), dtype=np.uint8)
-            for c in range(self.channels):
-                for b in range(self.bins):
-                    representation_resized[c, b] = cv2.resize(representation[c, b], (new_width, new_height), interpolation=cv2.INTER_LINEAR)
-            representation = representation_resized
-
-        return representation.reshape((2 * self.bins, self.height // 2, self.width // 2) if self.downsample else (2 * self.bins, self.height, self.width))
-
 
     def construct(self,
                   x: Union[th.Tensor, np.ndarray],
@@ -303,7 +335,6 @@ class StackedHistogram(RepresentationBase):
             return self.create_from_numpy(x, y, pol, time)
         else:
             raise ValueError("Unsupported type for input data.")
-
 
 def cumsum_channel(x: th.Tensor, num_channels: int):
     for i in reversed(range(num_channels)):
